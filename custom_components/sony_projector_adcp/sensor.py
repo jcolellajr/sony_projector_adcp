@@ -49,9 +49,14 @@ async def async_setup_entry(
     projector = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
 
+    # update_before_add: the 15-minute interval otherwise leaves these at
+    # "unknown" for a quarter of an hour after every restart.
     async_add_entities(
-        SonyProjectorHoursSensor(projector, name, config_entry.entry_id, key)
-        for key in COUNTERS
+        (
+            SonyProjectorHoursSensor(projector, name, config_entry.entry_id, key)
+            for key in COUNTERS
+        ),
+        update_before_add=True,
     )
 
 
