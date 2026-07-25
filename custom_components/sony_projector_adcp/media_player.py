@@ -15,7 +15,19 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
 
-from .const import DEFAULT_NAME, DOMAIN, INPUT_SOURCES, PICTURE_MODES, POWER_STATE_MAP
+from .const import (
+    ASPECT_MODES,
+    COLOR_TEMP_MODES,
+    DEFAULT_NAME,
+    DOMAIN,
+    INPUT_SOURCES,
+    LAMP_CONTROL_MODES,
+    MOTIONFLOW_MODES,
+    NUMERIC_ATTRIBUTES,
+    PICTURE_MODES,
+    POWER_STATE_MAP,
+    STRING_ATTRIBUTES,
+)
 from .protocol import SonyProjectorADCP
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,8 +41,11 @@ SERVICE_SET_PICTURE_MODE = "set_picture_mode"
 SERVICE_SET_BRIGHTNESS = "set_brightness"
 SERVICE_SET_CONTRAST = "set_contrast"
 SERVICE_SET_SHARPNESS = "set_sharpness"
-SERVICE_SET_LIGHT_OUTPUT = "set_light_output"
 SERVICE_SEND_RAW_COMMAND = "send_raw_command"
+SERVICE_SET_LAMP_CONTROL = "set_lamp_control"
+SERVICE_SET_MOTIONFLOW = "set_motionflow"
+SERVICE_SET_ASPECT = "set_aspect"
+SERVICE_SET_COLOR_TEMP = "set_color_temp"
 
 ATTR_KEY = "key"
 ATTR_MODE = "mode"
@@ -85,11 +100,29 @@ async def async_setup_entry(
     )
     
     platform.async_register_entity_service(
-        SERVICE_SET_LIGHT_OUTPUT,
-        {vol.Required(ATTR_VALUE): vol.All(vol.Coerce(int), vol.Range(min=0, max=100))},
-        "async_set_light_output",
+        SERVICE_SET_LAMP_CONTROL,
+        {vol.Required(ATTR_MODE): vol.In(list(LAMP_CONTROL_MODES.keys()))},
+        "async_set_lamp_control",
     )
-    
+
+    platform.async_register_entity_service(
+        SERVICE_SET_MOTIONFLOW,
+        {vol.Required(ATTR_MODE): vol.In(list(MOTIONFLOW_MODES.keys()))},
+        "async_set_motionflow",
+    )
+
+    platform.async_register_entity_service(
+        SERVICE_SET_ASPECT,
+        {vol.Required(ATTR_MODE): vol.In(list(ASPECT_MODES.keys()))},
+        "async_set_aspect",
+    )
+
+    platform.async_register_entity_service(
+        SERVICE_SET_COLOR_TEMP,
+        {vol.Required(ATTR_MODE): vol.In(list(COLOR_TEMP_MODES.keys()))},
+        "async_set_color_temp",
+    )
+
     platform.async_register_entity_service(
         "increase_brightness",
         {},
@@ -124,18 +157,6 @@ async def async_setup_entry(
         "decrease_sharpness",
         {},
         "async_decrease_sharpness",
-    )
-    
-    platform.async_register_entity_service(
-        "increase_light_output",
-        {},
-        "async_increase_light_output",
-    )
-    
-    platform.async_register_entity_service(
-        "decrease_light_output",
-        {},
-        "async_decrease_light_output",
     )
     
     platform.async_register_entity_service(
@@ -178,7 +199,7 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
             "identifiers": {(DOMAIN, entry_id)},
             "name": name,
             "manufacturer": "Sony",
-            "model": "VPL-XW5000",
+            "model": "VPL-VW715ES",
         }
         self._attr_state = MediaPlayerState.OFF
         self._current_source = None
@@ -187,8 +208,12 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         self._brightness = None
         self._contrast = None
         self._sharpness = None
-        self._light_output = None
         self._reality_creation = None
+        self._lamp_control = None
+        # Populated on the first successful poll and then left alone.
+        self._identity_loaded = False
+        # Free-form settings discovered by querying the unit; see const.py.
+        self._settings: dict[str, Any] = {}
 
     async def async_update(self) -> None:
         """Update the state of the projector."""
@@ -256,14 +281,15 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
                 except Exception as e:
                     _LOGGER.debug("Error getting sharpness: %s", e)
                 
-                # Get light output - keep last value if query fails
+                # Lamp control replaces the XW5000's light_output_val, which
+                # answers err_cmd on this lamp-based model.
                 try:
-                    light_output = await self._projector.get_numeric_value("light_output_val")
-                    if light_output is not None:
-                        self._light_output = light_output
+                    lamp_control = await self._projector.get_string_value("lamp_control")
+                    if lamp_control:
+                        self._lamp_control = lamp_control
                 except Exception as e:
-                    _LOGGER.debug("Error getting light output: %s", e)
-                
+                    _LOGGER.debug("Error getting lamp control: %s", e)
+
                 # Get reality creation - keep last value if query fails
                 try:
                     reality_creation = await self._projector.get_reality_creation()
@@ -271,15 +297,35 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
                         self._reality_creation = reality_creation
                 except Exception as e:
                     _LOGGER.debug("Error getting reality creation: %s", e)
+
+                # Remaining settings, table-driven. A query that comes back
+                # None (unsupported, or err_inactive for a signal-dependent
+                # setting like hdr) leaves the previous value untouched.
+                for command, attr in STRING_ATTRIBUTES.items():
+                    try:
+                        value = await self._projector.get_string_value(command)
+                        if value is not None:
+                            self._settings[attr] = value
+                    except Exception as e:
+                        _LOGGER.debug("Error getting %s: %s", command, e)
+
+                for command, attr in NUMERIC_ATTRIBUTES.items():
+                    try:
+                        value = await self._projector.get_numeric_value(command)
+                        if value is not None:
+                            self._settings[attr] = value
+                    except Exception as e:
+                        _LOGGER.debug("Error getting %s: %s", command, e)
             else:
                 # If powered off, clear these values
                 self._brightness = None
                 self._contrast = None
                 self._sharpness = None
-                self._light_output = None
                 self._picture_mode = None
                 self._reality_creation = None
-                    
+                self._lamp_control = None
+                self._settings.clear()
+
         except Exception as e:
             _LOGGER.error("Error updating projector state: %s", e)
             self._attr_available = False
@@ -331,10 +377,33 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         await self._projector.set_numeric_value("sharpness", value)
         self._sharpness = value
 
-    async def async_set_light_output(self, value: int) -> None:
-        """Set light output via service call."""
-        await self._projector.set_numeric_value("light_output_val", value)
-        self._light_output = value
+    async def async_set_lamp_control(self, mode: str) -> None:
+        """Set lamp output (low/high)."""
+        if await self._projector.set_string_value("lamp_control", mode):
+            self._lamp_control = mode
+        else:
+            _LOGGER.error("Failed to set lamp control to %s", mode)
+
+    async def async_set_motionflow(self, mode: str) -> None:
+        """Set Motionflow mode."""
+        if await self._projector.set_string_value("motionflow", mode):
+            self._settings["motionflow"] = mode
+        else:
+            _LOGGER.error("Failed to set motionflow to %s", mode)
+
+    async def async_set_aspect(self, mode: str) -> None:
+        """Set aspect ratio."""
+        if await self._projector.set_string_value("aspect", mode):
+            self._settings["aspect"] = mode
+        else:
+            _LOGGER.error("Failed to set aspect to %s", mode)
+
+    async def async_set_color_temp(self, mode: str) -> None:
+        """Set colour temperature preset."""
+        if await self._projector.set_string_value("color_temp", mode):
+            self._settings["color_temp"] = mode
+        else:
+            _LOGGER.error("Failed to set color temp to %s", mode)
 
     async def async_increase_brightness(self) -> None:
         """Increase brightness by 1."""
@@ -377,20 +446,6 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         new_value = max(current - 1, 0)
         await self._projector.set_numeric_value("sharpness", new_value)
         self._sharpness = new_value
-
-    async def async_increase_light_output(self) -> None:
-        """Increase light output by 1."""
-        current = self._light_output if self._light_output is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("light_output_val", new_value)
-        self._light_output = new_value
-
-    async def async_decrease_light_output(self) -> None:
-        """Decrease light output by 1."""
-        current = self._light_output if self._light_output is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("light_output_val", new_value)
-        self._light_output = new_value
 
     async def async_set_reality_creation(self, state: str) -> None:
         """Set Reality Creation on or off."""
@@ -444,11 +499,14 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         
         if self._sharpness is not None:
             attrs["sharpness"] = self._sharpness
-        
-        if self._light_output is not None:
-            attrs["light_output"] = self._light_output
-        
+
         if self._reality_creation is not None:
             attrs["reality_creation"] = self._reality_creation
-        
+
+        if self._lamp_control is not None:
+            attrs["lamp_control"] = self._lamp_control
+
+        # Table-driven settings (aspect, colour temp, Motionflow, ...).
+        attrs.update(self._settings)
+
         return attrs

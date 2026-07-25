@@ -1,6 +1,7 @@
 """Sony ADCP Protocol Handler."""
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Optional
 
@@ -161,9 +162,20 @@ class SonyProjectorADCP:
                     # A protocol-level rejection is a real answer, not a
                     # transport failure -- retrying would not change it.
                     if response.startswith("err_"):
-                        _LOGGER.error(
-                            "Command error: %s for command: %s", response, command
-                        )
+                        # err_inactive means the command exists but does not
+                        # apply right now (e.g. `hdr ?` while an SDR signal is
+                        # present). That is normal, not a fault, so it must not
+                        # be logged as an error on every poll.
+                        if response.startswith("err_inactive"):
+                            _LOGGER.debug(
+                                "Command %s not applicable in current state (%s)",
+                                command,
+                                response,
+                            )
+                        else:
+                            _LOGGER.error(
+                                "Command error: %s for command: %s", response, command
+                            )
                         return None
 
                     return response
@@ -257,6 +269,41 @@ class SonyProjectorADCP:
         command = f'key "{key}"'
         response = await self.send_command(command)
         return response == "ok"
+
+    async def get_string_value(self, parameter: str) -> Optional[str]:
+        """Get a quoted string parameter, e.g. `aspect ?` -> normal."""
+        response = await self.send_command(f"{parameter} ?")
+        if response and response.startswith('"') and response.endswith('"'):
+            return response.strip('"')
+        return None
+
+    async def set_string_value(self, parameter: str, value: str) -> bool:
+        """Set a quoted string parameter."""
+        response = await self.send_command(f'{parameter} "{value}"')
+        return response == "ok"
+
+    async def get_timer(self) -> Optional[dict]:
+        """Get the hour counters.
+
+        The projector answers a JSON array of single-key objects, e.g.
+        [{"operation":128},{"light_src":123},{"prev_light_src":0}]
+        which is flattened here to {"operation": 128, "light_src": 123, ...}.
+        """
+        response = await self.send_command("timer ?")
+        if not response:
+            return None
+        try:
+            entries = json.loads(response)
+        except (ValueError, TypeError):
+            _LOGGER.debug("Could not parse timer response: %s", response)
+            return None
+        if not isinstance(entries, list):
+            return None
+        merged: dict = {}
+        for entry in entries:
+            if isinstance(entry, dict):
+                merged.update(entry)
+        return merged or None
 
     async def get_reality_creation(self) -> Optional[str]:
         """Get Reality Creation status."""

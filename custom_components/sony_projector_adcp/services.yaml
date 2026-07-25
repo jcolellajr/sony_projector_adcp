@@ -125,24 +125,119 @@ set_sharpness:
           step: 1
           mode: slider
 
-set_light_output:
-  name: Set Light Output
-  description: Set the light output level
+# set_light_output / increase_light_output / decrease_light_output were removed:
+# light_output_val is the VPL-XW5000's laser command and answers err_cmd on the
+# lamp-based VW715ES. Use set_lamp_control instead.
+
+set_lamp_control:
+  name: Set Lamp Control
+  description: Set the lamp output level (Low or High)
   target:
     entity:
       domain: media_player
       integration: sony_projector_adcp
   fields:
-    value:
-      name: Light Output
-      description: Light output level (0-100)
+    mode:
+      name: Mode
+      description: Lamp output level
       required: true
       selector:
-        number:
-          min: 0
-          max: 100
-          step: 1
-          mode: slider
+        select:
+          options:
+            - label: Low
+              value: low
+            - label: High
+              value: high
+
+set_motionflow:
+  name: Set Motionflow
+  description: Set the Motionflow frame-interpolation mode
+  target:
+    entity:
+      domain: media_player
+      integration: sony_projector_adcp
+  fields:
+    mode:
+      name: Mode
+      description: Motionflow mode
+      required: true
+      selector:
+        select:
+          options:
+            - label: "Off"
+              value: "off"
+            - label: Smooth High
+              value: smooth_high
+            - label: Smooth Low
+              value: smooth_low
+            - label: Impulse
+              value: impulse
+            - label: Combination
+              value: combination
+            - label: True Cinema
+              value: true_cinema
+
+set_aspect:
+  name: Set Aspect Ratio
+  description: Set the aspect ratio
+  target:
+    entity:
+      domain: media_player
+      integration: sony_projector_adcp
+  fields:
+    mode:
+      name: Mode
+      description: Aspect ratio
+      required: true
+      selector:
+        select:
+          options:
+            - label: Normal
+              value: normal
+            - label: V Stretch
+              value: v_stretch
+            - label: "1.85:1 Zoom"
+              value: zoom_1_85
+            - label: "2.35:1 Zoom"
+              value: zoom_2_35
+            - label: Stretch
+              value: stretch
+            - label: Squeeze
+              value: squeeze
+
+set_color_temp:
+  name: Set Colour Temperature
+  description: Set the colour temperature preset
+  target:
+    entity:
+      domain: media_player
+      integration: sony_projector_adcp
+  fields:
+    mode:
+      name: Mode
+      description: Colour temperature preset
+      required: true
+      selector:
+        select:
+          options:
+            - label: D93
+              value: d93
+            - label: D75
+              value: d75
+            - label: D65
+              value: d65
+            - label: D55
+              value: d55
+            - label: Custom 1
+              value: custom1
+            - label: Custom 2
+              value: custom2
+            - label: Custom 3
+              value: custom3
+            - label: Custom 4
+              value: custom4
+            - label: Custom 5
+              value: custom5
 
 increase_brightness:
   name: Increase Brightness
@@ -187,22 +282,6 @@ increase_sharpness:
 decrease_sharpness:
   name: Decrease Sharpness
   description: Decrease sharpness by 1
-  target:
-    entity:
-      domain: media_player
-      integration: sony_projector_adcp
-
-increase_light_output:
-  name: Increase Light Output
-  description: Increase light output by 1
-  target:
-    entity:
-      domain: media_player
-      integration: sony_projector_adcp
-
-decrease_light_output:
-  name: Decrease Light Output
-  description: Decrease light output by 1
   target:
     entity:
       domain: media_player
