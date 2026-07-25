@@ -85,11 +85,29 @@ class SonyProjectorADCP:
                 self._writer = None
                 self._reader = None
 
+    def _connection_usable(self) -> bool:
+        """Whether the cached streams can still carry another command.
+
+        The projector closes an idle ADCP session after ~60s. A peer-side close
+        leaves ``_reader``/``_writer`` non-None, so a plain None-check reports a
+        dead socket as connected and the next command is written into the void.
+        This is best-effort only -- a close we have not observed yet is not
+        detectable here, which is why send_command() also retries once.
+        """
+        if self._reader is None or self._writer is None:
+            return False
+        if self._reader.at_eof():
+            return False
+        if self._writer.is_closing():
+            return False
+        transport = self._writer.transport
+        return transport is not None and not transport.is_closing()
+
     async def _read_line(self) -> str:
         """Read a line from the projector."""
         if not self._reader:
             raise ConnectionError("Not connected")
-        
+
         try:
             data = await asyncio.wait_for(
                 self._reader.readuntil(NEWLINE.encode(ENCODING)),
@@ -97,52 +115,74 @@ class SonyProjectorADCP:
             )
             return data.decode(ENCODING).strip()
         except asyncio.TimeoutError:
-            _LOGGER.error("Timeout reading from projector")
+            # Logged by the caller, which knows whether a retry remains.
+            _LOGGER.debug("Timeout reading from projector")
             raise
         except Exception as e:
-            _LOGGER.error("Error reading from projector: %s", e)
+            _LOGGER.debug("Error reading from projector: %s", e)
             raise
 
     async def _write_line(self, data: str):
         """Write a line to the projector."""
         if not self._writer:
             raise ConnectionError("Not connected")
-        
+
         try:
             self._writer.write(f"{data}{NEWLINE}".encode(ENCODING))
             await self._writer.drain()
         except Exception as e:
-            _LOGGER.error("Error writing to projector: %s", e)
+            _LOGGER.debug("Error writing to projector: %s", e)
             raise
 
     async def send_command(self, command: str) -> Optional[str]:
-        """Send a command and return the response."""
+        """Send a command and return the response.
+
+        Tries at most twice. The first attempt may reuse a cached session that
+        the projector has already closed on us; that failure is expected and
+        recoverable, so it is logged at debug and retried on a fresh connection.
+        Only a failure on the fresh connection is a real error.
+        """
         async with self._lock:
-            # Ensure we're connected
-            if not self._writer or not self._reader:
-                if not await self.connect():
-                    return None
-            
-            try:
-                # Send command
-                await self._write_line(command)
-                _LOGGER.debug("Sent command: %s", command)
-                
-                # Read response
-                response = await self._read_line()
-                _LOGGER.debug("Received response: %s", response)
-                
-                # Check for errors
-                if response.startswith("err_"):
-                    _LOGGER.error("Command error: %s for command: %s", response, command)
-                    return None
-                
-                return response
-                
-            except Exception as e:
-                _LOGGER.error("Error sending command %s: %s", command, e)
-                await self.disconnect()
-                return None
+            last_error: Optional[Exception] = None
+
+            for attempt in (1, 2):
+                if not self._connection_usable():
+                    await self.disconnect()
+                    if not await self.connect():
+                        return None
+
+                try:
+                    await self._write_line(command)
+                    _LOGGER.debug("Sent command: %s", command)
+
+                    response = await self._read_line()
+                    _LOGGER.debug("Received response: %s", response)
+
+                    # A protocol-level rejection is a real answer, not a
+                    # transport failure -- retrying would not change it.
+                    if response.startswith("err_"):
+                        _LOGGER.error(
+                            "Command error: %s for command: %s", response, command
+                        )
+                        return None
+
+                    return response
+
+                except Exception as e:
+                    last_error = e
+                    await self.disconnect()
+                    if attempt == 1:
+                        _LOGGER.debug(
+                            "Command %s failed on a reused session (%s); "
+                            "reconnecting and retrying",
+                            command,
+                            e,
+                        )
+
+            _LOGGER.error(
+                "Error sending command %s after reconnect: %s", command, last_error
+            )
+            return None
 
     async def get_power_status(self) -> Optional[str]:
         """Get the current power status."""
