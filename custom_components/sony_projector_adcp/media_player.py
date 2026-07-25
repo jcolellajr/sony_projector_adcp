@@ -1,5 +1,6 @@
 """Media Player entity for Sony Projector ADCP."""
 import logging
+from datetime import timedelta
 from typing import Any, Optional
 
 from homeassistant.components.media_player import (
@@ -18,6 +19,9 @@ from .const import DEFAULT_NAME, DOMAIN, INPUT_SOURCES, PICTURE_MODES, POWER_STA
 from .protocol import SonyProjectorADCP
 
 _LOGGER = logging.getLogger(__name__)
+
+# Poll every 30 seconds (module-level so HA's entity platform honors it)
+SCAN_INTERVAL = timedelta(seconds=30)
 
 # Service schemas
 SERVICE_SEND_KEY = "send_key"
@@ -189,14 +193,18 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
     async def async_update(self) -> None:
         """Update the state of the projector."""
         try:
-            # Get power status
+            # Get power status. send_command() returns None on any connection
+            # failure (it never raises), so a falsy result means the projector
+            # is unreachable -- report unavailable instead of keeping stale state.
             power_status = await self._projector.get_power_status()
-            if power_status:
-                self._attr_state = (
-                    MediaPlayerState.ON
-                    if POWER_STATE_MAP.get(power_status) == "on"
-                    else MediaPlayerState.OFF
-                )
+            if power_status is None:
+                self._attr_available = False
+                return
+            self._attr_state = (
+                MediaPlayerState.ON
+                if POWER_STATE_MAP.get(power_status) == "on"
+                else MediaPlayerState.OFF
+            )
             
             # Get additional info if powered on
             if self._attr_state == MediaPlayerState.ON:
