@@ -4,6 +4,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import CONF_USE_AUTH, DEFAULT_PASSWORD, DEFAULT_USE_AUTH, DOMAIN
 from .protocol import SonyProjectorADCP
@@ -22,10 +23,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     projector = SonyProjectorADCP(host, port, password, use_auth)
 
-    # Test connection
+    # Test connection. Raise (not return False) so HA retries with backoff
+    # and the entry self-recovers when the projector answers again.
     if not await projector.connect():
-        _LOGGER.error("Failed to connect to projector at %s:%s", host, port)
-        return False
+        raise ConfigEntryNotReady(f"Cannot connect to projector at {host}:{port}")
 
     await projector.disconnect()
 

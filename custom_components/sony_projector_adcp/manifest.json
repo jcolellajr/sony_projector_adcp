@@ -7,5 +7,5 @@
     "documentation": "https://github.com/jcolellajr/sony_projector_adcp",
     "iot_class": "local_polling",
     "requirements": [],
-    "version": "1.1.1"
+    "version": "1.1.2"
   }
