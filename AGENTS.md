@@ -25,6 +25,29 @@ history there.
 - Bump `manifest.json` `version` with every behavioral change, and deploy the
   bumped manifest together with the code so the running version string always
   identifies what is deployed.
+- Deploy every tracked file under `custom_components/sony_projector_adcp/`,
+  including `translations/en.json`. HA reads custom-integration UI text from
+  `translations/`, not `strings.json`; the two must stay identical, and a test
+  enforces that.
+- To confirm new code actually loaded after the restart, check the config
+  entry's flags in `/api/config/config_entries/entry` (e.g.
+  `supports_reconfigure`). HA's loader log line does not print the version.
+  HACS's `update.sony_projector_adcp_update` reports GitHub releases, not the
+  deployed manifest, so it is not evidence either.
+
+## Validation — required before every deploy
+
+The suite runs against a fake ADCP server and is pinned to the production HA
+release in `requirements_test.txt`. Bump that pin when production HA moves.
+
+```bash
+uv venv .venv && VIRTUAL_ENV=.venv uv pip install -r requirements_test.txt
+.venv/bin/python -m pytest -q
+```
+
+Tests cannot show what the real projector answers. Any change to what counts
+as success or failure for a command needs one live check per command family
+(power, input, picture mode, numeric step) before it is called done.
 
 ## Hardware truths — do not "correct" from datasheets
 
@@ -35,6 +58,11 @@ history there.
   closes idle ADCP sessions after ~60s, and its ADCP daemon can wedge while
   SDCP/HTTP stay up (2026-08-09 incident — fix is toggling ADCP off/on in the
   projector settings; a lamp power cycle does not revive it).
+- Observed 2026-10-06 (projector in standby): ADCP authentication is **off**
+  (greeting is `NOKEY`), and a second concurrent TCP connection was accepted
+  and greeted while another was open. Only the greetings were checked, not
+  commands on two sessions at once, so do not build on concurrent sessions
+  without testing them.
 
 ## Git rules
 

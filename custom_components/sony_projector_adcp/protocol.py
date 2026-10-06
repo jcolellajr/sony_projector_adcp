@@ -54,6 +54,8 @@ class SonyProjectorADCP:
         self.auth_failed = False
         # Why the most recent send_command() did not succeed, for error messages.
         self.last_error: Optional[str] = None
+        # Set by close(); stops send_command() from reconnecting afterwards.
+        self._closed = False
 
     async def connect(self) -> bool:
         """Connect and authenticate; False on any failure (never raises)."""
@@ -144,12 +146,22 @@ class SonyProjectorADCP:
             _LOGGER.error("Authentication failed: %s", reason)
         self.auth_failed = True
 
+    async def close(self) -> None:
+        """Disconnect for good: wait for any command in flight, then refuse
+        to reconnect. Used on unload so a late background refresh cannot
+        leave a session open on a projector whose ADCP daemon can wedge."""
+        async with self._lock:
+            self._closed = True
+            await self.disconnect()
+
     async def disconnect(self):
         """Disconnect from the projector."""
         if self._writer:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                # Bounded: close() holds the lock here, so a hung close
+                # would otherwise hang unload with it.
+                await asyncio.wait_for(self._writer.wait_closed(), TIMEOUT)
             except Exception as e:
                 _LOGGER.debug("Error closing connection: %s", e)
             finally:
@@ -216,6 +228,9 @@ class SonyProjectorADCP:
         async with self._lock:
             last_error: Optional[Exception] = None
             self.last_error = None
+            if self._closed:
+                self.last_error = "connection closed"
+                return None
 
             for attempt in (1, 2):
                 if not self._connection_usable():

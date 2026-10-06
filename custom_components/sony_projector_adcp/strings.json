@@ -42,5 +42,98 @@
       "reauth_successful": "Password updated",
       "reconfigure_successful": "Projector settings updated"
     }
+  },
+  "entity": {
+    "select": {
+      "picture_mode": {
+        "name": "Picture mode",
+        "state": {
+          "cinema_film1": "Cinema Film 1",
+          "cinema_film2": "Cinema Film 2",
+          "reference": "Reference",
+          "tv": "TV",
+          "photo": "Photo",
+          "game": "Game",
+          "brt_cinema": "Bright Cinema",
+          "brt_tv": "Bright TV",
+          "user1": "User 1",
+          "user2": "User 2",
+          "user3": "User 3"
+        }
+      },
+      "lamp_control": {
+        "name": "Lamp control",
+        "state": {
+          "low": "Low",
+          "high": "High"
+        }
+      },
+      "motionflow": {
+        "name": "Motionflow",
+        "state": {
+          "off": "Off",
+          "smooth_high": "Smooth High",
+          "smooth_low": "Smooth Low",
+          "impulse": "Impulse",
+          "combination": "Combination",
+          "true_cinema": "True Cinema"
+        }
+      },
+      "aspect": {
+        "name": "Aspect ratio",
+        "state": {
+          "normal": "Normal",
+          "v_stretch": "V Stretch",
+          "zoom_1_85": "1.85:1 Zoom",
+          "zoom_2_35": "2.35:1 Zoom",
+          "stretch": "Stretch",
+          "squeeze": "Squeeze"
+        }
+      },
+      "color_temp": {
+        "name": "Colour temperature",
+        "state": {
+          "d93": "D93",
+          "d75": "D75",
+          "d65": "D65",
+          "d55": "D55",
+          "custom1": "Custom 1",
+          "custom2": "Custom 2",
+          "custom3": "Custom 3",
+          "custom4": "Custom 4",
+          "custom5": "Custom 5"
+        }
+      }
+    },
+    "number": {
+      "brightness": {
+        "name": "Brightness"
+      },
+      "contrast": {
+        "name": "Contrast"
+      },
+      "sharpness": {
+        "name": "Sharpness"
+      }
+    },
+    "switch": {
+      "video_mute": {
+        "name": "Video mute"
+      },
+      "reality_creation": {
+        "name": "Reality Creation"
+      }
+    },
+    "sensor": {
+      "lamp_hours": {
+        "name": "Lamp Hours"
+      },
+      "operation_hours": {
+        "name": "Operation Hours"
+      },
+      "prev_lamp_hours": {
+        "name": "Previous Lamp Hours"
+      }
+    }
   }
 }

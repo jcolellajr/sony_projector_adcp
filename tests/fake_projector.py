@@ -21,6 +21,10 @@ class FakeProjector:
             "timer ?": '[{"operation":128},{"light_src":123},{"prev_light_src":0}]',
         }
         self.received: list[str] = []
+        # Command line -> event; the reply waits until the event is set.
+        # Lets a test hold a poll mid-flight.
+        self.hold: dict[str, asyncio.Event] = {}
+        self.holding = asyncio.Event()
         self.port = 0
         self._server: asyncio.base_events.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
@@ -69,6 +73,9 @@ class FakeProjector:
             while True:
                 line = (await reader.readuntil(b"\r\n")).decode().strip()
                 self.received.append(line)
+                if line in self.hold:
+                    self.holding.set()
+                    await self.hold[line].wait()
                 writer.write(f"{self._respond(line)}\r\n".encode())
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):

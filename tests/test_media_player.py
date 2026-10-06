@@ -1,8 +1,10 @@
 """Media player service behaviour."""
+import logging
+
 import pytest
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers.entity_component import async_update_entity
+from homeassistant.helpers import entity_registry as er
 
 from custom_components.sony_projector_adcp.const import DOMAIN
 
@@ -26,7 +28,6 @@ async def loaded(hass, projector):
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    await async_update_entity(hass, ENTITY)
     return entry
 
 
@@ -88,22 +89,81 @@ async def test_raw_command_failure_raises(hass, projector, loaded):
 
 
 async def test_unavailable_then_recovers(hass, projector, loaded, caplog):
+    coordinator = loaded.runtime_data
     projector.password = "changed-on-device"
     projector.drop_sessions()
-    await async_update_entity(hass, ENTITY)
-    assert hass.states.get(ENTITY).state == "unavailable"
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "unavailable"
     flows = hass.config_entries.flow.async_progress()
     assert [f["context"]["source"] for f in flows] == [SOURCE_REAUTH]
 
     # Further failed polls neither log again nor stack up reauth prompts.
     caplog.clear()
-    await async_update_entity(hass, ENTITY)
+    await coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert "unavailable" not in caplog.text
+    assert "Authentication failed" not in caplog.text
     assert len(hass.config_entries.flow.async_progress()) == 1
 
     projector.password = "Projector"
-    await async_update_entity(hass, ENTITY)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
     assert hass.states.get(ENTITY).state == "on"
-    assert "available again" in caplog.text
+    assert "recovered" in caplog.text
+
+
+async def test_unreachable_logs_once(hass, projector, loaded, caplog):
+    coordinator = loaded.runtime_data
+    coordinator.projector.port = 1  # nothing listens there
+    projector.drop_sessions()
+    caplog.clear()
+    for _ in range(3):
+        await coordinator.async_refresh()
+    assert hass.states.get(ENTITY).state == "unavailable"
+    loud = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and "unreachable" in r.getMessage()
+    ]
+    assert len(loud) == 1
+
+
+async def test_service_call_does_not_repoll(hass, projector, loaded):
+    """A setting change sends one command, not a full ~19-command poll."""
+    projector.received.clear()
+    await _call(hass, "set_brightness", value=70)
+    await hass.async_block_till_done()
+    assert projector.received == ["brightness 70"]
+    assert hass.states.get(ENTITY).attributes["brightness"] == 70
+
+
+async def test_raw_command_returns_response(hass, projector, loaded):
+    projector.responses["lamp_control ?"] = '"low"'
+    result = await hass.services.async_call(
+        DOMAIN,
+        "send_raw_command",
+        {"entity_id": ENTITY, "command": "lamp_control ?"},
+        blocking=True,
+        return_response=True,
+    )
+    assert result == {ENTITY: {"response": '"low"'}}
+
+
+async def test_turn_on_shows_warmup_immediately(hass, projector):
+    entry = entry_for(projector)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "off"
+
+    projector.responses["power_status ?"] = '"startup"'
+    await _call(hass, "turn_on", domain="media_player")
+    state = hass.states.get(ENTITY)
+    assert state.state == "on"
+    assert state.attributes["power_status"] == "startup"
+    await hass.async_block_till_done()
+
+
+async def test_unique_id_unchanged(hass, loaded):
+    """Entity registry entries from before the coordinator must keep matching."""
+    registry = er.async_get(hass)
+    assert registry.async_get(ENTITY).unique_id == f"{loaded.entry_id}_media_player"
