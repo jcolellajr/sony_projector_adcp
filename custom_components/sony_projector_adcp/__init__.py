@@ -4,10 +4,10 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .const import CONF_USE_AUTH, DEFAULT_PASSWORD, DEFAULT_USE_AUTH, DOMAIN
-from .protocol import SonyProjectorADCP
+from .protocol import CannotConnect, InvalidAuth, SonyProjectorADCP
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,11 +24,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     projector = SonyProjectorADCP(host, port, password, use_auth)
 
     # Test connection. Raise (not return False) so HA retries with backoff
-    # and the entry self-recovers when the projector answers again.
-    if not await projector.connect():
-        raise ConfigEntryNotReady(f"Cannot connect to projector at {host}:{port}")
-
-    await projector.disconnect()
+    # and the entry self-recovers when the projector answers again. A rejected
+    # password is not transient: ConfigEntryAuthFailed starts a reauth flow.
+    try:
+        await projector.validate()
+    except InvalidAuth as err:
+        raise ConfigEntryAuthFailed(
+            f"Projector at {host}:{port} rejected the ADCP password"
+        ) from err
+    except CannotConnect as err:
+        raise ConfigEntryNotReady(
+            f"Cannot connect to projector at {host}:{port}"
+        ) from err
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = projector

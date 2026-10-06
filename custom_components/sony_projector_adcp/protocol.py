@@ -11,6 +11,31 @@ NEWLINE = "\r\n"
 ENCODING = "ascii"
 TIMEOUT = 10
 
+# ADCP rejection codes -> what they mean for the person who sent the command.
+# From Sony's ADCP protocol documentation; the raw code is always shown too.
+ERROR_DESCRIPTIONS = {
+    "err_cmd": "command not supported by this projector",
+    "err_option": "invalid option",
+    "err_val": "value out of range",
+    "err_inactive": (
+        "not available right now (projector off, warming up, cooling down, "
+        "or no signal)"
+    ),
+    "err_auth": "authentication failed",
+}
+
+
+class ProjectorError(Exception):
+    """Base error for projector communication."""
+
+
+class CannotConnect(ProjectorError):
+    """The projector did not accept a connection or stopped answering."""
+
+
+class InvalidAuth(ProjectorError):
+    """The projector rejected the ADCP password."""
+
 
 class SonyProjectorADCP:
     """Handle ADCP protocol communication with Sony projector."""
@@ -24,24 +49,53 @@ class SonyProjectorADCP:
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
+        # True while the projector is rejecting our password. Lets the entity
+        # layer start a reauth flow instead of reporting a plain outage.
+        self.auth_failed = False
+        # Why the most recent send_command() did not succeed, for error messages.
+        self.last_error: Optional[str] = None
 
     async def connect(self) -> bool:
+        """Connect and authenticate; False on any failure (never raises)."""
+        try:
+            await self._open_session()
+        except ProjectorError:
+            return False
+        return True
+
+    async def validate(self) -> None:
+        """Open and close one session, raising CannotConnect or InvalidAuth."""
+        try:
+            await self._open_session()
+        finally:
+            await self.disconnect()
+
+    async def _open_session(self) -> None:
         """Connect to the projector and authenticate if needed."""
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=TIMEOUT
             )
-            
+
             # Read authentication challenge
             auth_response = await self._read_line()
+
+            if not self.use_auth and auth_response != "NOKEY":
+                # The projector wants a password but none is configured.
+                # Without this, the session "opens" and every command then
+                # fails with err_auth, which looks like an outage.
+                await self.disconnect()
+                self._note_auth_rejected("projector requires authentication")
+                raise InvalidAuth("projector requires authentication")
             
             if auth_response.startswith("PJLINK") or not self.use_auth:
                 # If we get PJLINK or auth is disabled, we might need different handling
                 # For now, just continue
                 if auth_response == "NOKEY":
                     _LOGGER.debug("Authentication disabled on projector")
-                    return True
+                    self.auth_failed = False
+                    return
             
             # Authentication enabled - handle random number
             if self.use_auth and auth_response:
@@ -60,19 +114,35 @@ class SonyProjectorADCP:
                     auth_result = await self._read_line()
                     
                     if auth_result != "OK":
-                        _LOGGER.error("Authentication failed: %s", auth_result)
                         await self.disconnect()
-                        return False
-            
-            _LOGGER.info("Connected to Sony projector at %s:%s", self.host, self.port)
-            return True
-            
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout connecting to projector")
-            return False
+                        self._note_auth_rejected(auth_result)
+                        raise InvalidAuth(auth_result)
+
+            self.auth_failed = False
+            _LOGGER.debug("Connected to Sony projector at %s:%s", self.host, self.port)
+
+        except InvalidAuth:
+            raise
+        except asyncio.TimeoutError as e:
+            # Debug only: while the projector is unreachable this fires on every
+            # poll. The entity logs the unavailable/available transitions.
+            _LOGGER.debug("Timeout connecting to projector")
+            await self.disconnect()
+            # Unreachable says nothing about the password; don't keep
+            # reporting an earlier rejection as the reason.
+            self.auth_failed = False
+            raise CannotConnect("timeout") from e
         except Exception as e:
-            _LOGGER.error("Error connecting to projector: %s", e)
-            return False
+            _LOGGER.debug("Error connecting to projector: %s", e)
+            await self.disconnect()
+            self.auth_failed = False
+            raise CannotConnect(str(e)) from e
+
+    def _note_auth_rejected(self, reason: str) -> None:
+        """Record a password rejection, logging once per episode, not per poll."""
+        if not self.auth_failed:
+            _LOGGER.error("Authentication failed: %s", reason)
+        self.auth_failed = True
 
     async def disconnect(self):
         """Disconnect from the projector."""
@@ -145,11 +215,17 @@ class SonyProjectorADCP:
         """
         async with self._lock:
             last_error: Optional[Exception] = None
+            self.last_error = None
 
             for attempt in (1, 2):
                 if not self._connection_usable():
                     await self.disconnect()
                     if not await self.connect():
+                        self.last_error = (
+                            "authentication failed"
+                            if self.auth_failed
+                            else "cannot connect to projector"
+                        )
                         return None
 
                 try:
@@ -162,6 +238,7 @@ class SonyProjectorADCP:
                     # A protocol-level rejection is a real answer, not a
                     # transport failure -- retrying would not change it.
                     if response.startswith("err_"):
+                        self.last_error = response
                         # err_inactive means the command exists but does not
                         # apply right now (e.g. `hdr ?` while an SDR signal is
                         # present). That is normal, not a fault, so it must not
@@ -194,7 +271,26 @@ class SonyProjectorADCP:
             _LOGGER.error(
                 "Error sending command %s after reconnect: %s", command, last_error
             )
+            self.last_error = "no response from projector"
             return None
+
+    def describe_last_error(self) -> str:
+        """Human-readable reason the most recent command did not succeed."""
+        code = self.last_error
+        if code is None:
+            return "unexpected response from projector"
+        if code in ERROR_DESCRIPTIONS:
+            return f"{ERROR_DESCRIPTIONS[code]} ({code})"
+        return code
+
+    async def _expect_ok(self, command: str) -> bool:
+        """Send a set-style command; True only if the projector answers ok."""
+        response = await self.send_command(command)
+        if response == "ok":
+            return True
+        if response is not None:
+            self.last_error = f"unexpected response {response!r}"
+        return False
 
     async def get_power_status(self) -> Optional[str]:
         """Get the current power status."""
@@ -206,8 +302,7 @@ class SonyProjectorADCP:
     async def set_power(self, state: bool) -> bool:
         """Set power on or off."""
         command = 'power "on"' if state else 'power "off"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def get_input(self) -> Optional[str]:
         """Get current input source."""
@@ -219,8 +314,7 @@ class SonyProjectorADCP:
     async def set_input(self, source: str) -> bool:
         """Set input source."""
         command = f'input "{source}"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def get_blank_status(self) -> Optional[bool]:
         """Get video muting status."""
@@ -232,8 +326,7 @@ class SonyProjectorADCP:
     async def set_blank(self, state: bool) -> bool:
         """Set video muting."""
         command = 'blank "on"' if state else 'blank "off"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def get_picture_mode(self) -> Optional[str]:
         """Get current picture mode."""
@@ -245,8 +338,7 @@ class SonyProjectorADCP:
     async def set_picture_mode(self, mode: str) -> bool:
         """Set picture mode."""
         command = f'picture_mode "{mode}"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def get_numeric_value(self, parameter: str) -> Optional[int]:
         """Get a numeric parameter value."""
@@ -261,14 +353,12 @@ class SonyProjectorADCP:
     async def set_numeric_value(self, parameter: str, value: int) -> bool:
         """Set a numeric parameter value."""
         command = f"{parameter} {value}"
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def send_key(self, key: str) -> bool:
         """Send a remote control key command."""
         command = f'key "{key}"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)
 
     async def get_string_value(self, parameter: str) -> Optional[str]:
         """Get a quoted string parameter, e.g. `aspect ?` -> normal."""
@@ -279,8 +369,7 @@ class SonyProjectorADCP:
 
     async def set_string_value(self, parameter: str, value: str) -> bool:
         """Set a quoted string parameter."""
-        response = await self.send_command(f'{parameter} "{value}"')
-        return response == "ok"
+        return await self._expect_ok(f'{parameter} "{value}"')
 
     async def get_timer(self) -> Optional[dict]:
         """Get the hour counters.
@@ -315,5 +404,4 @@ class SonyProjectorADCP:
     async def set_reality_creation(self, state: str) -> bool:
         """Set Reality Creation on/off."""
         command = f'real_cre "{state}"'
-        response = await self.send_command(command)
-        return response == "ok"
+        return await self._expect_ok(command)

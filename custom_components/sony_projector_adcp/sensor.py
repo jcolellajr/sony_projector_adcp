@@ -10,14 +10,21 @@ sensor rather than burying in a media_player attribute.
 Polled far less often than the media player: these move by one unit per hour of
 use, and ADCP accepts only one session at a time, so there is no reason to
 contend with the media player's 30s poll for a value that changes hourly.
+
+A failed read keeps the last value instead of going unavailable. The counters
+only advance while the lamp is lit, and the projector spends most of the day in
+standby or unreachable, when the last reading is still exactly right. Going
+unavailable there blanked the dashboard and gapped the history most of the day.
+The last value is also restored across restarts (RestoreSensor), so it is
+correct even if HA starts while the projector cannot be read.
 """
 import logging
 from datetime import timedelta
 from typing import Optional
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
-    SensorEntity,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -60,7 +67,7 @@ async def async_setup_entry(
     )
 
 
-class SonyProjectorHoursSensor(SensorEntity):
+class SonyProjectorHoursSensor(RestoreSensor):
     """An hour counter read from the projector's `timer` response."""
 
     _attr_has_entity_name = True
@@ -90,25 +97,31 @@ class SonyProjectorHoursSensor(SensorEntity):
         }
         self._attr_native_value: Optional[int] = None
 
+    async def async_added_to_hass(self) -> None:
+        """Restore the last reading if the first poll could not get one."""
+        await super().async_added_to_hass()
+        # update_before_add runs before this, so a fresh value wins.
+        if self._attr_native_value is not None:
+            return
+        if (last := await self.async_get_last_sensor_data()) is None:
+            return
+        if isinstance(last.native_value, (int, float)):
+            self._attr_native_value = int(last.native_value)
+            self._attr_available = True
+
     async def async_update(self) -> None:
         """Read the hour counters."""
+        value = None
         try:
             counters = await self._projector.get_timer()
         except Exception as e:  # noqa: BLE001 - never let a poll kill the entity
             _LOGGER.debug("Error reading projector timers: %s", e)
-            self._attr_available = False
-            return
+            counters = None
 
-        if not counters:
-            # Standby answers nothing useful; keep the last known reading
-            # rather than blanking a monotonic counter.
-            self._attr_available = False
-            return
+        if counters:
+            value = counters.get(self._counter_key)
 
-        value = counters.get(self._counter_key)
-        if value is None:
-            self._attr_available = False
-            return
-
-        self._attr_native_value = value
-        self._attr_available = True
+        if value is not None:
+            self._attr_native_value = value
+        # Unavailable only until there has ever been a reading; see module doc.
+        self._attr_available = self._attr_native_value is not None

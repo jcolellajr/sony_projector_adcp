@@ -10,7 +10,8 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get_current_platform
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
@@ -53,6 +54,10 @@ ATTR_VALUE = "value"
 ATTR_COMMAND = "command"
 
 KEY_COMMANDS = ["menu", "up", "down", "left", "right", "enter", "reset", "blank"]
+
+# Range of the step services (increase_/decrease_brightness etc.).
+STEP_MIN = 0
+STEP_MAX = 100
 
 
 async def async_setup_entry(
@@ -214,6 +219,41 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         self._identity_loaded = False
         # Free-form settings discovered by querying the unit; see const.py.
         self._settings: dict[str, Any] = {}
+        # One reauth prompt per outage, not one per poll.
+        self._reauth_requested = False
+
+    def _set_available(self, available: bool) -> None:
+        """Record availability, logging only the transitions.
+
+        The projector is routinely unreachable (powered at the wall, network
+        sleep), so per-poll failures are logged at debug in protocol.py and
+        only the change of state is logged here.
+        """
+        if available and not self._attr_available:
+            _LOGGER.info("Projector at %s is available again", self._projector.host)
+        elif not available and self._attr_available:
+            _LOGGER.info(
+                "Projector at %s is unavailable: %s",
+                self._projector.host,
+                self._projector.describe_last_error(),
+            )
+        self._attr_available = available
+
+        if available:
+            self._reauth_requested = False
+        elif self._projector.auth_failed and not self._reauth_requested:
+            # The password changed under us; ask for the new one instead of
+            # silently staying unavailable until the next restart.
+            self._reauth_requested = True
+            self.platform.config_entry.async_start_reauth(self.hass)
+
+    def _require(self, result: bool, action: str) -> None:
+        """Raise a user-visible error when the projector did not accept a command."""
+        if not result:
+            raise HomeAssistantError(
+                f"Projector could not {action}: "
+                f"{self._projector.describe_last_error()}"
+            )
 
     async def async_update(self) -> None:
         """Update the state of the projector."""
@@ -223,7 +263,7 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
             # is unreachable -- report unavailable instead of keeping stale state.
             power_status = await self._projector.get_power_status()
             if power_status is None:
-                self._attr_available = False
+                self._set_available(False)
                 return
             self._attr_state = (
                 MediaPlayerState.ON
@@ -328,18 +368,18 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
 
         except Exception as e:
             _LOGGER.error("Error updating projector state: %s", e)
-            self._attr_available = False
+            self._set_available(False)
             return
-        
-        self._attr_available = True
+
+        self._set_available(True)
 
     async def async_turn_on(self) -> None:
         """Turn the projector on."""
-        await self._projector.set_power(True)
+        self._require(await self._projector.set_power(True), "turn on")
 
     async def async_turn_off(self) -> None:
         """Turn the projector off."""
-        await self._projector.set_power(False)
+        self._require(await self._projector.set_power(False), "turn off")
 
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
@@ -348,112 +388,124 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
             if name == source:
                 source_key = key
                 break
-        
-        if source_key:
-            await self._projector.set_input(source_key)
-            self._current_source = source_key
+
+        if source_key is None:
+            raise ServiceValidationError(
+                f"Unknown source {source!r}; expected one of "
+                f"{', '.join(INPUT_SOURCES.values())}"
+            )
+        self._require(
+            await self._projector.set_input(source_key), f"switch to {source}"
+        )
+        self._current_source = source_key
 
     async def async_send_key(self, key: str) -> None:
         """Send a remote control key command."""
-        await self._projector.send_key(key)
+        self._require(await self._projector.send_key(key), f"send key {key}")
 
     async def async_set_picture_mode_service(self, mode: str) -> None:
         """Set picture mode via service call."""
-        await self._projector.set_picture_mode(mode)
+        self._require(
+            await self._projector.set_picture_mode(mode), f"set picture mode {mode}"
+        )
         self._picture_mode = mode
+
+    async def _set_numeric(self, parameter: str, value: int) -> None:
+        """Set brightness/contrast/sharpness and cache it only on success."""
+        self._require(
+            await self._projector.set_numeric_value(parameter, value),
+            f"set {parameter} to {value}",
+        )
+        setattr(self, f"_{parameter}", value)
+
+    async def _step_numeric(self, parameter: str, delta: int) -> None:
+        """Move a numeric setting by ``delta`` from its current device value.
+
+        Read fresh rather than from the poll cache: the cache can be up to 30s
+        stale (or empty right after a restart), and stepping from a stale or
+        assumed value makes the picture jump.
+        """
+        current = await self._projector.get_numeric_value(parameter)
+        if current is None:
+            raise HomeAssistantError(
+                f"Projector could not read current {parameter}: "
+                f"{self._projector.describe_last_error()}"
+            )
+        await self._set_numeric(
+            parameter, max(STEP_MIN, min(current + delta, STEP_MAX))
+        )
 
     async def async_set_brightness(self, value: int) -> None:
         """Set brightness via service call."""
-        await self._projector.set_numeric_value("brightness", value)
-        self._brightness = value
+        await self._set_numeric("brightness", value)
 
     async def async_set_contrast(self, value: int) -> None:
         """Set contrast via service call."""
-        await self._projector.set_numeric_value("contrast", value)
-        self._contrast = value
+        await self._set_numeric("contrast", value)
 
     async def async_set_sharpness(self, value: int) -> None:
         """Set sharpness via service call."""
-        await self._projector.set_numeric_value("sharpness", value)
-        self._sharpness = value
+        await self._set_numeric("sharpness", value)
 
     async def async_set_lamp_control(self, mode: str) -> None:
         """Set lamp output (low/high)."""
-        if await self._projector.set_string_value("lamp_control", mode):
-            self._lamp_control = mode
-        else:
-            _LOGGER.error("Failed to set lamp control to %s", mode)
+        self._require(
+            await self._projector.set_string_value("lamp_control", mode),
+            f"set lamp control to {mode}",
+        )
+        self._lamp_control = mode
+
+    async def _set_setting(self, parameter: str, mode: str, label: str) -> None:
+        """Set a table-driven string setting and cache it only on success."""
+        self._require(
+            await self._projector.set_string_value(parameter, mode),
+            f"set {label} to {mode}",
+        )
+        self._settings[parameter] = mode
 
     async def async_set_motionflow(self, mode: str) -> None:
         """Set Motionflow mode."""
-        if await self._projector.set_string_value("motionflow", mode):
-            self._settings["motionflow"] = mode
-        else:
-            _LOGGER.error("Failed to set motionflow to %s", mode)
+        await self._set_setting("motionflow", mode, "Motionflow")
 
     async def async_set_aspect(self, mode: str) -> None:
         """Set aspect ratio."""
-        if await self._projector.set_string_value("aspect", mode):
-            self._settings["aspect"] = mode
-        else:
-            _LOGGER.error("Failed to set aspect to %s", mode)
+        await self._set_setting("aspect", mode, "aspect")
 
     async def async_set_color_temp(self, mode: str) -> None:
         """Set colour temperature preset."""
-        if await self._projector.set_string_value("color_temp", mode):
-            self._settings["color_temp"] = mode
-        else:
-            _LOGGER.error("Failed to set color temp to %s", mode)
+        await self._set_setting("color_temp", mode, "colour temperature")
 
     async def async_increase_brightness(self) -> None:
         """Increase brightness by 1."""
-        current = self._brightness if self._brightness is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("brightness", new_value)
-        self._brightness = new_value
+        await self._step_numeric("brightness", 1)
 
     async def async_decrease_brightness(self) -> None:
         """Decrease brightness by 1."""
-        current = self._brightness if self._brightness is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("brightness", new_value)
-        self._brightness = new_value
+        await self._step_numeric("brightness", -1)
 
     async def async_increase_contrast(self) -> None:
         """Increase contrast by 1."""
-        current = self._contrast if self._contrast is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("contrast", new_value)
-        self._contrast = new_value
+        await self._step_numeric("contrast", 1)
 
     async def async_decrease_contrast(self) -> None:
         """Decrease contrast by 1."""
-        current = self._contrast if self._contrast is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("contrast", new_value)
-        self._contrast = new_value
+        await self._step_numeric("contrast", -1)
 
     async def async_increase_sharpness(self) -> None:
         """Increase sharpness by 1."""
-        current = self._sharpness if self._sharpness is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("sharpness", new_value)
-        self._sharpness = new_value
+        await self._step_numeric("sharpness", 1)
 
     async def async_decrease_sharpness(self) -> None:
         """Decrease sharpness by 1."""
-        current = self._sharpness if self._sharpness is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("sharpness", new_value)
-        self._sharpness = new_value
+        await self._step_numeric("sharpness", -1)
 
     async def async_set_reality_creation(self, state: str) -> None:
         """Set Reality Creation on or off."""
-        success = await self._projector.set_reality_creation(state)
-        if success:
-            self._reality_creation = state
-        else:
-            _LOGGER.error("Failed to set reality creation to %s", state)
+        self._require(
+            await self._projector.set_reality_creation(state),
+            f"set Reality Creation {state}",
+        )
+        self._reality_creation = state
 
     async def async_toggle_reality_creation(self) -> None:
         """Toggle Reality Creation on/off."""
@@ -464,10 +516,12 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
     async def async_send_raw_command(self, command: str) -> None:
         """Send a raw ADCP command to the projector."""
         response = await self._projector.send_command(command)
-        if response:
-            _LOGGER.info("Raw command '%s' returned: %s", command, response)
-        else:
-            _LOGGER.error("Raw command '%s' failed", command)
+        if response is None:
+            raise HomeAssistantError(
+                f"Raw command {command!r} failed: "
+                f"{self._projector.describe_last_error()}"
+            )
+        _LOGGER.info("Raw command '%s' returned: %s", command, response)
 
     @property
     def source(self) -> Optional[str]:
