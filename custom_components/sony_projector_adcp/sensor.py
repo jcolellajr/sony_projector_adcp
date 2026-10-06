@@ -7,108 +7,92 @@ On a lamp-based model (VPL-VW715ES) `light_src` is lamp hours, which is the
 number that decides when a lamp needs replacing -- worth surfacing as a proper
 sensor rather than burying in a media_player attribute.
 
-Polled far less often than the media player: these move by one unit per hour of
-use, and ADCP accepts only one session at a time, so there is no reason to
-contend with the media player's 30s poll for a value that changes hourly.
+The coordinator reads the counters every 15 minutes; they move by one unit per
+hour of use.
+
+A failed read keeps the last value instead of going unavailable. The counters
+only advance while the lamp is lit, and the projector spends most of the day in
+standby or unreachable, when the last reading is still exactly right. Going
+unavailable there blanked the dashboard and gapped the history most of the day.
+The last value is also restored across restarts (RestoreSensor), so it is
+correct even if HA starts while the projector cannot be read.
 """
-import logging
-from datetime import timedelta
 from typing import Optional
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
-    SensorEntity,
     SensorStateClass,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.const import UnitOfTime
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DEFAULT_NAME, DOMAIN
-from .protocol import SonyProjectorADCP
+from .coordinator import SonyProjectorConfigEntry, SonyProjectorCoordinator
+from .entity import SonyProjectorEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-SCAN_INTERVAL = timedelta(minutes=15)
-
-# ADCP timer key -> (entity name suffix, unique_id suffix, enabled by default)
+# ADCP timer key -> (translation key / unique_id suffix, enabled by default).
+# The unique_id suffixes predate the coordinator and must not change.
 COUNTERS = {
-    "light_src": ("Lamp Hours", "lamp_hours", True),
-    "operation": ("Operation Hours", "operation_hours", True),
-    "prev_light_src": ("Previous Lamp Hours", "prev_lamp_hours", False),
+    "light_src": ("lamp_hours", True),
+    "operation": ("operation_hours", True),
+    "prev_light_src": ("prev_lamp_hours", False),
 }
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: SonyProjectorConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the projector hour counters."""
-    projector = hass.data[DOMAIN][config_entry.entry_id]
-    name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
-
-    # update_before_add: the 15-minute interval otherwise leaves these at
-    # "unknown" for a quarter of an hour after every restart.
+    coordinator = config_entry.runtime_data
     async_add_entities(
-        (
-            SonyProjectorHoursSensor(projector, name, config_entry.entry_id, key)
-            for key in COUNTERS
-        ),
-        update_before_add=True,
+        SonyProjectorHoursSensor(coordinator, key) for key in COUNTERS
     )
 
 
-class SonyProjectorHoursSensor(SensorEntity):
+class SonyProjectorHoursSensor(SonyProjectorEntity, RestoreSensor):
     """An hour counter read from the projector's `timer` response."""
 
-    _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_native_unit_of_measurement = UnitOfTime.HOURS
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
-    def __init__(
-        self,
-        projector: SonyProjectorADCP,
-        name: str,
-        entry_id: str,
-        counter_key: str,
-    ) -> None:
+    def __init__(self, coordinator: SonyProjectorCoordinator, counter_key: str) -> None:
         """Initialize the sensor."""
-        label, uid_suffix, enabled = COUNTERS[counter_key]
-        self._projector = projector
+        uid_suffix, enabled = COUNTERS[counter_key]
+        super().__init__(coordinator, uid_suffix)
         self._counter_key = counter_key
-        self._attr_name = label
-        self._attr_unique_id = f"{entry_id}_{uid_suffix}"
+        self._attr_translation_key = uid_suffix
         self._attr_entity_registry_enabled_default = enabled
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry_id)},
-            "name": name,
-            "manufacturer": "Sony",
-            "model": "VPL-VW715ES",
-        }
         self._attr_native_value: Optional[int] = None
+        self._read_counter()
 
-    async def async_update(self) -> None:
-        """Read the hour counters."""
-        try:
-            counters = await self._projector.get_timer()
-        except Exception as e:  # noqa: BLE001 - never let a poll kill the entity
-            _LOGGER.debug("Error reading projector timers: %s", e)
-            self._attr_available = False
+    def _read_counter(self) -> None:
+        """Take the counter from the snapshot, keeping the last value if absent."""
+        data = self.coordinator.data
+        if data and data.timer and data.timer.get(self._counter_key) is not None:
+            self._attr_native_value = data.timer[self._counter_key]
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last reading if the first poll could not get one."""
+        await super().async_added_to_hass()
+        if self._attr_native_value is not None:
             return
-
-        if not counters:
-            # Standby answers nothing useful; keep the last known reading
-            # rather than blanking a monotonic counter.
-            self._attr_available = False
+        if (last := await self.async_get_last_sensor_data()) is None:
             return
+        if isinstance(last.native_value, (int, float)):
+            self._attr_native_value = int(last.native_value)
 
-        value = counters.get(self._counter_key)
-        if value is None:
-            self._attr_available = False
-            return
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._read_counter()
+        super()._handle_coordinator_update()
 
-        self._attr_native_value = value
-        self._attr_available = True
+    @property
+    def available(self) -> bool:
+        """Unavailable only until there has ever been a reading; see module doc."""
+        return self._attr_native_value is not None

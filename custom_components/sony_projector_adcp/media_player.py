@@ -1,6 +1,5 @@
 """Media Player entity for Sony Projector ADCP."""
 import logging
-from datetime import timedelta
 from typing import Any, Optional
 
 from homeassistant.components.media_player import (
@@ -8,32 +7,28 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get_current_platform
 import voluptuous as vol
-from homeassistant.helpers import config_validation as cv
 
 from .const import (
     ASPECT_MODES,
     COLOR_TEMP_MODES,
-    DEFAULT_NAME,
-    DOMAIN,
     INPUT_SOURCES,
     LAMP_CONTROL_MODES,
     MOTIONFLOW_MODES,
     NUMERIC_ATTRIBUTES,
     PICTURE_MODES,
-    POWER_STATE_MAP,
     STRING_ATTRIBUTES,
 )
-from .protocol import SonyProjectorADCP
+from .coordinator import SonyProjectorConfigEntry
+from .entity import SonyProjectorEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-# Poll every 30 seconds (module-level so HA's entity platform honors it)
-SCAN_INTERVAL = timedelta(seconds=30)
+# Commands are serialized by the protocol lock; no need to limit here.
+PARALLEL_UPDATES = 0
 
 # Service schemas
 SERVICE_SEND_KEY = "send_key"
@@ -57,14 +52,11 @@ KEY_COMMANDS = ["menu", "up", "down", "left", "right", "enter", "reset", "blank"
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: SonyProjectorConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Sony Projector media player."""
-    projector = hass.data[DOMAIN][config_entry.entry_id]
-    name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
-    
-    async_add_entities([SonyProjectorMediaPlayer(projector, name, config_entry.entry_id)])
+    async_add_entities([SonyProjectorMediaPlayer(config_entry.runtime_data)])
     
     # Register services
     platform = async_get_current_platform()
@@ -175,13 +167,17 @@ async def async_setup_entry(
         SERVICE_SEND_RAW_COMMAND,
         {vol.Required(ATTR_COMMAND): str},
         "async_send_raw_command",
+        # The projector's answer comes back to the caller (Developer Tools
+        # shows it) instead of only going to the log.
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
 
-class SonyProjectorMediaPlayer(MediaPlayerEntity):
-    """Representation of a Sony Projector as a Media Player."""
+class SonyProjectorMediaPlayer(SonyProjectorEntity, MediaPlayerEntity):
+    """The projector as a media player: power, input, and every setting as
+    attributes. The per-setting entities (select/number/switch) are the
+    dashboard-friendly controls; the services here stay for automations."""
 
-    _attr_has_entity_name = True
     _attr_name = None
     _attr_supported_features = (
         MediaPlayerEntityFeature.TURN_ON
@@ -189,157 +185,23 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
         | MediaPlayerEntityFeature.SELECT_SOURCE
     )
 
-    def __init__(
-        self, projector: SonyProjectorADCP, name: str, entry_id: str
-    ) -> None:
+    def __init__(self, coordinator) -> None:
         """Initialize the media player."""
-        self._projector = projector
-        self._attr_unique_id = f"{entry_id}_media_player"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry_id)},
-            "name": name,
-            "manufacturer": "Sony",
-            "model": "VPL-VW715ES",
-        }
-        self._attr_state = MediaPlayerState.OFF
-        self._current_source = None
-        self._is_blank = False
-        self._picture_mode = None
-        self._brightness = None
-        self._contrast = None
-        self._sharpness = None
-        self._reality_creation = None
-        self._lamp_control = None
-        # Populated on the first successful poll and then left alone.
-        self._identity_loaded = False
-        # Free-form settings discovered by querying the unit; see const.py.
-        self._settings: dict[str, Any] = {}
+        super().__init__(coordinator, "media_player")
 
-    async def async_update(self) -> None:
-        """Update the state of the projector."""
-        try:
-            # Get power status. send_command() returns None on any connection
-            # failure (it never raises), so a falsy result means the projector
-            # is unreachable -- report unavailable instead of keeping stale state.
-            power_status = await self._projector.get_power_status()
-            if power_status is None:
-                self._attr_available = False
-                return
-            self._attr_state = (
-                MediaPlayerState.ON
-                if POWER_STATE_MAP.get(power_status) == "on"
-                else MediaPlayerState.OFF
-            )
-            
-            # Get additional info if powered on
-            if self._attr_state == MediaPlayerState.ON:
-                # Get input source
-                try:
-                    source = await self._projector.get_input()
-                    if source:
-                        self._current_source = source
-                except Exception as e:
-                    _LOGGER.debug("Error getting input source: %s", e)
-                
-                # Get blank status
-                try:
-                    blank_status = await self._projector.get_blank_status()
-                    if blank_status is not None:
-                        self._is_blank = blank_status
-                except Exception as e:
-                    _LOGGER.debug("Error getting blank status: %s", e)
-                
-                # Get picture mode - keep last value if query fails
-                try:
-                    picture_mode = await self._projector.get_picture_mode()
-                    if picture_mode:
-                        self._picture_mode = picture_mode
-                except Exception as e:
-                    _LOGGER.debug("Error getting picture mode: %s", e)
-                
-                # Get brightness - keep last value if query fails
-                try:
-                    brightness = await self._projector.get_numeric_value("brightness")
-                    if brightness is not None:
-                        self._brightness = brightness
-                except Exception as e:
-                    _LOGGER.debug("Error getting brightness: %s", e)
-                
-                # Get contrast - keep last value if query fails
-                try:
-                    contrast = await self._projector.get_numeric_value("contrast")
-                    if contrast is not None:
-                        self._contrast = contrast
-                except Exception as e:
-                    _LOGGER.debug("Error getting contrast: %s", e)
-                
-                # Get sharpness - keep last value if query fails
-                try:
-                    sharpness = await self._projector.get_numeric_value("sharpness")
-                    if sharpness is not None:
-                        self._sharpness = sharpness
-                except Exception as e:
-                    _LOGGER.debug("Error getting sharpness: %s", e)
-                
-                # Lamp control replaces the XW5000's light_output_val, which
-                # answers err_cmd on this lamp-based model.
-                try:
-                    lamp_control = await self._projector.get_string_value("lamp_control")
-                    if lamp_control:
-                        self._lamp_control = lamp_control
-                except Exception as e:
-                    _LOGGER.debug("Error getting lamp control: %s", e)
-
-                # Get reality creation - keep last value if query fails
-                try:
-                    reality_creation = await self._projector.get_reality_creation()
-                    if reality_creation:
-                        self._reality_creation = reality_creation
-                except Exception as e:
-                    _LOGGER.debug("Error getting reality creation: %s", e)
-
-                # Remaining settings, table-driven. A query that comes back
-                # None (unsupported, or err_inactive for a signal-dependent
-                # setting like hdr) leaves the previous value untouched.
-                for command, attr in STRING_ATTRIBUTES.items():
-                    try:
-                        value = await self._projector.get_string_value(command)
-                        if value is not None:
-                            self._settings[attr] = value
-                    except Exception as e:
-                        _LOGGER.debug("Error getting %s: %s", command, e)
-
-                for command, attr in NUMERIC_ATTRIBUTES.items():
-                    try:
-                        value = await self._projector.get_numeric_value(command)
-                        if value is not None:
-                            self._settings[attr] = value
-                    except Exception as e:
-                        _LOGGER.debug("Error getting %s: %s", command, e)
-            else:
-                # If powered off, clear these values
-                self._brightness = None
-                self._contrast = None
-                self._sharpness = None
-                self._picture_mode = None
-                self._reality_creation = None
-                self._lamp_control = None
-                self._settings.clear()
-
-        except Exception as e:
-            _LOGGER.error("Error updating projector state: %s", e)
-            self._attr_available = False
-            return
-        
-        self._attr_available = True
+    @property
+    def state(self) -> MediaPlayerState:
+        """On while on or warming up; off in standby or cooling down."""
+        data = self.coordinator.data
+        return MediaPlayerState.ON if data and data.is_on else MediaPlayerState.OFF
 
     async def async_turn_on(self) -> None:
         """Turn the projector on."""
-        await self._projector.set_power(True)
+        await self.coordinator.async_set_power(True)
 
     async def async_turn_off(self) -> None:
         """Turn the projector off."""
-        await self._projector.set_power(False)
+        await self.coordinator.async_set_power(False)
 
     async def async_select_source(self, source: str) -> None:
         """Select input source."""
@@ -348,132 +210,97 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
             if name == source:
                 source_key = key
                 break
-        
-        if source_key:
-            await self._projector.set_input(source_key)
-            self._current_source = source_key
+
+        if source_key is None:
+            raise ServiceValidationError(
+                f"Unknown source {source!r}; expected one of "
+                f"{', '.join(INPUT_SOURCES.values())}"
+            )
+        await self.coordinator.async_set_source(source_key, source)
 
     async def async_send_key(self, key: str) -> None:
         """Send a remote control key command."""
-        await self._projector.send_key(key)
+        await self.coordinator.async_send_key(key)
 
     async def async_set_picture_mode_service(self, mode: str) -> None:
         """Set picture mode via service call."""
-        await self._projector.set_picture_mode(mode)
-        self._picture_mode = mode
+        await self.coordinator.async_set_string("picture_mode", mode, "picture mode")
 
     async def async_set_brightness(self, value: int) -> None:
         """Set brightness via service call."""
-        await self._projector.set_numeric_value("brightness", value)
-        self._brightness = value
+        await self.coordinator.async_set_numeric("brightness", value)
 
     async def async_set_contrast(self, value: int) -> None:
         """Set contrast via service call."""
-        await self._projector.set_numeric_value("contrast", value)
-        self._contrast = value
+        await self.coordinator.async_set_numeric("contrast", value)
 
     async def async_set_sharpness(self, value: int) -> None:
         """Set sharpness via service call."""
-        await self._projector.set_numeric_value("sharpness", value)
-        self._sharpness = value
+        await self.coordinator.async_set_numeric("sharpness", value)
 
     async def async_set_lamp_control(self, mode: str) -> None:
         """Set lamp output (low/high)."""
-        if await self._projector.set_string_value("lamp_control", mode):
-            self._lamp_control = mode
-        else:
-            _LOGGER.error("Failed to set lamp control to %s", mode)
+        await self.coordinator.async_set_string("lamp_control", mode, "lamp control")
 
     async def async_set_motionflow(self, mode: str) -> None:
         """Set Motionflow mode."""
-        if await self._projector.set_string_value("motionflow", mode):
-            self._settings["motionflow"] = mode
-        else:
-            _LOGGER.error("Failed to set motionflow to %s", mode)
+        await self.coordinator.async_set_string("motionflow", mode, "Motionflow")
 
     async def async_set_aspect(self, mode: str) -> None:
         """Set aspect ratio."""
-        if await self._projector.set_string_value("aspect", mode):
-            self._settings["aspect"] = mode
-        else:
-            _LOGGER.error("Failed to set aspect to %s", mode)
+        await self.coordinator.async_set_string("aspect", mode, "aspect")
 
     async def async_set_color_temp(self, mode: str) -> None:
         """Set colour temperature preset."""
-        if await self._projector.set_string_value("color_temp", mode):
-            self._settings["color_temp"] = mode
-        else:
-            _LOGGER.error("Failed to set color temp to %s", mode)
+        await self.coordinator.async_set_string(
+            "color_temp", mode, "colour temperature"
+        )
 
     async def async_increase_brightness(self) -> None:
         """Increase brightness by 1."""
-        current = self._brightness if self._brightness is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("brightness", new_value)
-        self._brightness = new_value
+        await self.coordinator.async_step_numeric("brightness", 1)
 
     async def async_decrease_brightness(self) -> None:
         """Decrease brightness by 1."""
-        current = self._brightness if self._brightness is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("brightness", new_value)
-        self._brightness = new_value
+        await self.coordinator.async_step_numeric("brightness", -1)
 
     async def async_increase_contrast(self) -> None:
         """Increase contrast by 1."""
-        current = self._contrast if self._contrast is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("contrast", new_value)
-        self._contrast = new_value
+        await self.coordinator.async_step_numeric("contrast", 1)
 
     async def async_decrease_contrast(self) -> None:
         """Decrease contrast by 1."""
-        current = self._contrast if self._contrast is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("contrast", new_value)
-        self._contrast = new_value
+        await self.coordinator.async_step_numeric("contrast", -1)
 
     async def async_increase_sharpness(self) -> None:
         """Increase sharpness by 1."""
-        current = self._sharpness if self._sharpness is not None else 50
-        new_value = min(current + 1, 100)
-        await self._projector.set_numeric_value("sharpness", new_value)
-        self._sharpness = new_value
+        await self.coordinator.async_step_numeric("sharpness", 1)
 
     async def async_decrease_sharpness(self) -> None:
         """Decrease sharpness by 1."""
-        current = self._sharpness if self._sharpness is not None else 50
-        new_value = max(current - 1, 0)
-        await self._projector.set_numeric_value("sharpness", new_value)
-        self._sharpness = new_value
+        await self.coordinator.async_step_numeric("sharpness", -1)
 
     async def async_set_reality_creation(self, state: str) -> None:
         """Set Reality Creation on or off."""
-        success = await self._projector.set_reality_creation(state)
-        if success:
-            self._reality_creation = state
-        else:
-            _LOGGER.error("Failed to set reality creation to %s", state)
+        await self.coordinator.async_set_string("real_cre", state, "Reality Creation")
 
     async def async_toggle_reality_creation(self) -> None:
         """Toggle Reality Creation on/off."""
-        current = self._reality_creation if self._reality_creation else "off"
+        data = self.coordinator.data
+        current = (data.values.get("real_cre") if data else None) or "off"
         new_state = "off" if current == "on" else "on"
         await self.async_set_reality_creation(new_state)
 
-    async def async_send_raw_command(self, command: str) -> None:
+    async def async_send_raw_command(self, command: str) -> dict[str, Any]:
         """Send a raw ADCP command to the projector."""
-        response = await self._projector.send_command(command)
-        if response:
-            _LOGGER.info("Raw command '%s' returned: %s", command, response)
-        else:
-            _LOGGER.error("Raw command '%s' failed", command)
+        return {"response": await self.coordinator.async_send_raw(command)}
 
     @property
     def source(self) -> Optional[str]:
         """Return the current input source."""
-        if self._current_source:
-            return INPUT_SOURCES.get(self._current_source)
+        data = self.coordinator.data
+        if data and data.source:
+            return INPUT_SOURCES.get(data.source)
         return None
 
     @property
@@ -483,30 +310,35 @@ class SonyProjectorMediaPlayer(MediaPlayerEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return additional state attributes."""
-        attrs = {
-            "video_muted": self._is_blank,
+        """Return additional state attributes.
+
+        Names and values match the pre-coordinator entity so existing
+        templates and automations keep working.
+        """
+        data = self.coordinator.data
+        if data is None:
+            return {}
+        attrs: dict[str, Any] = {
+            "video_muted": bool(data.blank),
+            # Raw phase, e.g. startup / cooling1 -- the state alone is on/off.
+            "power_status": data.power_status,
         }
-        
-        if self._picture_mode:
-            attrs["picture_mode"] = PICTURE_MODES.get(self._picture_mode, self._picture_mode)
-        
-        if self._brightness is not None:
-            attrs["brightness"] = self._brightness
-        
-        if self._contrast is not None:
-            attrs["contrast"] = self._contrast
-        
-        if self._sharpness is not None:
-            attrs["sharpness"] = self._sharpness
+        values = data.values if data.is_on else {}
 
-        if self._reality_creation is not None:
-            attrs["reality_creation"] = self._reality_creation
-
-        if self._lamp_control is not None:
-            attrs["lamp_control"] = self._lamp_control
+        if picture_mode := values.get("picture_mode"):
+            attrs["picture_mode"] = PICTURE_MODES.get(picture_mode, picture_mode)
+        for parameter in ("brightness", "contrast", "sharpness"):
+            if values.get(parameter) is not None:
+                attrs[parameter] = values[parameter]
+        if values.get("real_cre") is not None:
+            attrs["reality_creation"] = values["real_cre"]
+        if values.get("lamp_control") is not None:
+            attrs["lamp_control"] = values["lamp_control"]
 
         # Table-driven settings (aspect, colour temp, Motionflow, ...).
-        attrs.update(self._settings)
+        for table in (STRING_ATTRIBUTES, NUMERIC_ATTRIBUTES):
+            for parameter, attr in table.items():
+                if values.get(parameter) is not None:
+                    attrs[attr] = values[parameter]
 
         return attrs

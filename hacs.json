@@ -3,7 +3,7 @@
   "content_in_root": false,
   "filename": "sony_projector_adcp",
   "render_readme": true,
-  "domains": ["media_player", "sensor"],
+  "domains": ["media_player", "number", "remote", "select", "sensor", "switch"],
   "iot_class": "Local Polling",
-  "homeassistant": "2023.1.0"
+  "homeassistant": "2024.12.0"
 }
