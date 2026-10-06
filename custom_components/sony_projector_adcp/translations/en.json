@@ -40,7 +40,9 @@
       "already_configured": "This projector is already configured",
       "already_in_progress": "Setup for this projector is already in progress",
       "reauth_successful": "Password updated",
-      "reconfigure_successful": "Projector settings updated"
+      "reconfigure_successful": "Projector settings updated",
+      "wrong_device": "That address belongs to a different projector (serial number does not match).",
+      "unknown_device": "Not a projector configured in this integration."
     }
   },
   "entity": {
@@ -134,6 +136,12 @@
       "prev_lamp_hours": {
         "name": "Previous Lamp Hours"
       }
+    }
+  },
+  "issues": {
+    "adcp_unresponsive": {
+      "title": "Projector control (ADCP) is not responding",
+      "description": "The projector at {host} is on the network (it answers on port {port}), but its ADCP control service is not responding, so Home Assistant cannot control it.\n\nIn the projector's network settings, turn ADCP off and back on. Power-cycling the lamp does not fix this. If ADCP was turned off on purpose, turn it back on.\n\nThis warning clears on its own once ADCP answers again."
     }
   }
 }

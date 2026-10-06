@@ -63,6 +63,11 @@ as success or failure for a command needs one live check per command family
   and greeted while another was open. Only the greetings were checked, not
   commands on two sessions at once, so do not build on concurrent sessions
   without testing them.
+- Also observed 2026-10-06 in standby: `serialnum ?` → `"5100123"`,
+  `mac_address ?` → `"94-db-56-7b-0d-9d"`, `modelname ?` → `"VPL-VW715ES"`;
+  SDCP (TCP 53484) and the web UI (TCP 80) both accept connections. From 1.3.0
+  the config entry is keyed by that serial number, and the ADCP lock-up Repair
+  relies on those two ports answering while ADCP does not.
 
 ## Git rules
 

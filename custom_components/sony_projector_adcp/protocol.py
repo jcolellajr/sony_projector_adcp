@@ -168,6 +168,11 @@ class SonyProjectorADCP:
                 self._writer = None
                 self._reader = None
 
+    @property
+    def connected(self) -> bool:
+        """Whether a session is currently open."""
+        return self._connection_usable()
+
     def _connection_usable(self) -> bool:
         """Whether the cached streams can still carry another command.
 

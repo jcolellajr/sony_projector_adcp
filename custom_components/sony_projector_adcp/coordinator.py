@@ -8,6 +8,7 @@ snapshot in place instead of re-polling.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 import logging
@@ -17,6 +18,8 @@ from typing import Any, Optional
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -40,6 +43,41 @@ NUMERIC_SETTINGS = ["brightness", "contrast", "sharpness", *NUMERIC_ATTRIBUTES]
 # Range of the numeric controls and step services.
 NUMERIC_MIN = 0
 NUMERIC_MAX = 100
+
+# ADCP lock-up detection (2026-08-09 incident: the ADCP daemon wedged while
+# SDCP and HTTP kept answering; toggling ADCP in the projector's settings
+# fixed it, a lamp power cycle did not). After this many consecutive failed
+# polls (~90s) we check whether the projector still answers on another
+# control port; if it does, ADCP itself is the problem and a Repair says so.
+WEDGE_POLLS = 3
+OTHER_PORTS = (53484, 80)  # SDCP / PJ Talk, web UI -- both open in standby
+PORT_PROBE_TIMEOUT = 3  # seconds
+
+
+def adcp_issue_id(entry_id: str) -> str:
+    """Repair issue id for one config entry."""
+    return f"adcp_unresponsive_{entry_id}"
+
+
+async def _port_open(host: str, port: int) -> bool:
+    """Whether ``host`` accepts a TCP connection on ``port``. Sends nothing."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), PORT_PROBE_TIMEOUT
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    return True
+
+
+@dataclass(frozen=True)
+class ProjectorIdentity:
+    """Read once per setup; None where the projector did not answer."""
+
+    serial: Optional[str] = None
+    mac: Optional[str] = None
+    model: Optional[str] = None
 
 
 @dataclass
@@ -100,6 +138,34 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
         # lock), so the poll may have read a value from before the command;
         # these are re-applied to its result so a slider does not jump back.
         self._poll_overrides: Optional[dict[str, Any]] = None
+        self.identity = ProjectorIdentity()
+        # Consecutive failed polls, kept in hass.data so the count survives
+        # setup retries and reloads -- each of those builds a new coordinator,
+        # and a projector whose ADCP is stuck at startup never gets past the
+        # first poll of any one of them.
+        self._failed_polls: dict[str, int] = hass.data.setdefault(
+            DOMAIN, {}
+        ).setdefault("failed_polls", {})
+
+    async def _async_setup(self) -> None:
+        """Read serial number, MAC and model before the first poll.
+
+        Verified on the VW715ES (2026-10-06, standby): `serialnum ?` ->
+        "5100123", `mac_address ?` -> "94-db-56-7b-0d-9d", `modelname ?` ->
+        "VPL-VW715ES". A failure leaves the field None; the first poll then
+        decides whether setup proceeds.
+        """
+        serial = await self.projector.get_string_value("serialnum")
+        if serial is None and not self.projector.connected:
+            # Unreachable: don't wait out two more connect timeouts before
+            # the first poll reports it.
+            return
+        mac = await self.projector.get_string_value("mac_address")
+        self.identity = ProjectorIdentity(
+            serial=serial,
+            mac=format_mac(mac) if mac else None,
+            model=await self.projector.get_string_value("modelname"),
+        )
 
     async def _async_update_data(self) -> ProjectorState:
         """Fetch a fresh snapshot, keeping changes made while it ran."""
@@ -123,9 +189,10 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
             if self.projector.auth_failed:
                 # Starts a reauth flow; see DataUpdateCoordinator.
                 raise ConfigEntryAuthFailed(self.projector.describe_last_error())
-            raise UpdateFailed(
-                f"Projector unreachable: {self.projector.describe_last_error()}"
-            )
+            reason = self.projector.describe_last_error()
+            await self._check_for_wedge()
+            raise UpdateFailed(f"Projector unreachable: {reason}")
+        self._clear_wedge()
 
         previous = self.data
         state = ProjectorState(
@@ -163,6 +230,53 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
                 self._timer_read_at = now
 
         return state
+
+    # -- ADCP lock-up repair -------------------------------------------------
+
+    @property
+    def _issue_id(self) -> str:
+        return adcp_issue_id(self.config_entry.entry_id)
+
+    def _issue_raised(self) -> bool:
+        # The registry, not a flag: the issue outlives this coordinator. Only
+        # an active one counts -- after a restart HA restores issues as
+        # inactive stubs, and treating a stub as raised would suppress the
+        # Repair for exactly the user who restarted HA to try to fix it.
+        issue = ir.async_get(self.hass).async_get_issue(DOMAIN, self._issue_id)
+        return issue is not None and issue.active
+
+    async def _check_for_wedge(self) -> None:
+        """Raise the Repair if ADCP keeps failing while the projector is up."""
+        entry_id = self.config_entry.entry_id
+        self._failed_polls[entry_id] = self._failed_polls.get(entry_id, 0) + 1
+        if self._failed_polls[entry_id] < WEDGE_POLLS or self._issue_raised():
+            return
+        host = self.projector.host
+        for port in OTHER_PORTS:
+            if await _port_open(host, port):
+                _LOGGER.warning(
+                    "Projector at %s answers on port %s but not on ADCP; "
+                    "ADCP is likely stuck or disabled",
+                    host,
+                    port,
+                )
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    self._issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="adcp_unresponsive",
+                    translation_placeholders={"host": host, "port": str(port)},
+                )
+                return
+
+    def _clear_wedge(self) -> None:
+        """ADCP answered: reset the counter and withdraw the Repair."""
+        self._failed_polls.pop(self.config_entry.entry_id, None)
+        # Unconditional: also clears an inactive stub left by a restart.
+        # A no-op when there is nothing to delete.
+        ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
 
     # -- commands -------------------------------------------------------------
 

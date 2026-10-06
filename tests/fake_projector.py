@@ -19,6 +19,10 @@ class FakeProjector:
         self.responses: dict[str, str] = {
             "power_status ?": '"standby"',
             "timer ?": '[{"operation":128},{"light_src":123},{"prev_light_src":0}]',
+            # Formats as answered by the real VW715ES (2026-10-06).
+            "serialnum ?": '"5100123"',
+            "mac_address ?": '"94-db-56-7b-0d-9d"',
+            "modelname ?": '"VPL-VW715ES"',
         }
         self.received: list[str] = []
         # Command line -> event; the reply waits until the event is set.
@@ -29,8 +33,9 @@ class FakeProjector:
         self._server: asyncio.base_events.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
 
-    async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+    async def start(self, port: int = 0) -> None:
+        """Listen on ``port`` (0 = any free port)."""
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", port)
         self.port = self._server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from homeassistant.const import CONF_NAME
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DEFAULT_NAME, DOMAIN
@@ -18,12 +18,22 @@ class SonyProjectorEntity(CoordinatorEntity[SonyProjectorCoordinator]):
         super().__init__(coordinator)
         entry = coordinator.config_entry
         self._attr_unique_id = f"{entry.entry_id}_{key}"
+        identity = coordinator.identity
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name=entry.data.get(CONF_NAME, DEFAULT_NAME),
             manufacturer="Sony",
-            model="VPL-VW715ES",
+            model=identity.model or "VPL-VW715ES",
+            # The MAC links this device to the router's view of it and lets
+            # DHCP discovery follow the projector to a new IP address.
+            connections=(
+                {(CONNECTION_NETWORK_MAC, identity.mac)} if identity.mac else set()
+            ),
         )
+        if identity.serial:
+            # Only when known: an explicit None would erase a stored serial
+            # after a setup whose identity read failed.
+            self._attr_device_info["serial_number"] = identity.serial
 
 
 class SonyProjectorSettingEntity(SonyProjectorEntity):
