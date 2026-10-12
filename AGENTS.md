@@ -15,6 +15,11 @@ history there.
 - Deploy over SSH (`jcolellajr@192.168.1.158`, key
   `~/.ssh/id_ed25519_homeassistant`; `sudo` required for `/config`), e.g.
   `cat <file> | ssh … "sudo tee /config/custom_components/sony_projector_adcp/<file>"`.
+  To copy every tracked file in one step with `root:root` 644/755 kept (used
+  for 1.3.1):
+  `git -c tar.umask=022 archive HEAD custom_components/sony_projector_adcp | ssh … "sudo tar -x -f - -C /config"`.
+  In zsh, keep the ssh invocation in a shell function, not a variable: zsh does
+  not word-split `$SSH`, so the command never runs.
 - The deployed tree must stay **byte-identical** to this repo — verify with
   `sha1sum` after every copy. If they differ, this repo is behind, not ahead:
   reconcile before editing.
@@ -29,11 +34,17 @@ history there.
   including `translations/en.json`. HA reads custom-integration UI text from
   `translations/`, not `strings.json`; the two must stay identical, and a test
   enforces that.
-- To confirm new code actually loaded after the restart, check the config
-  entry's flags in `/api/config/config_entries/entry` (e.g.
-  `supports_reconfigure`). HA's loader log line does not print the version.
-  HACS's `update.sony_projector_adcp_update` reports GitHub releases, not the
-  deployed manifest, so it is not evidence either.
+- To prove which version loaded after the restart, ask HA for the manifest it
+  loaded: the WebSocket command `manifest/get` with
+  `{"integration": "sony_projector_adcp"}` returns its `version`. With the
+  `hass` wrapper:
+  `hass -o json raw ws manifest/get --json '{"integration":"sony_projector_adcp"}'`.
+  Verified 2026-10-12: it reported 1.3.1 right after that deploy. Also check
+  that `__pycache__` was rebuilt after the restart. HA's loader log line does
+  not print the version, and HACS's `update.sony_projector_adcp_update`
+  reports GitHub releases, not the deployed manifest, so neither is evidence.
+  Config entry flags in `/api/config/config_entries/entry` (e.g.
+  `supports_reconfigure`) only help when a release changes them.
 
 ## Validation — required before every deploy
 
@@ -41,9 +52,18 @@ The suite runs against a fake ADCP server and is pinned to the production HA
 release in `requirements_test.txt`. Bump that pin when production HA moves.
 
 ```bash
-uv venv .venv && VIRTUAL_ENV=.venv uv pip install -r requirements_test.txt
+uv venv .venv --python 3.14 && VIRTUAL_ENV=.venv uv pip install -r requirements_test.txt
 .venv/bin/python -m pytest -q
 ```
+
+The pinned test package needs a recent Python: the 2026.10.1 build needs
+**Python ≥ 3.14.2**. uv's default interpreter can be older, and then the
+install fails to resolve.
+
+Known environmental failure: `test_identity.py::test_dhcp_keeps_a_hostname`
+fails on a machine where `localhost` resolves to `::1` first (the owner's
+Mac does), because `pytest-socket` allows only `127.0.0.1`. It fails identically
+on 1.3.0 and 1.3.1. Any other failure is real.
 
 Tests cannot show what the real projector answers. Any change to what counts
 as success or failure for a command needs one live check per command family
@@ -68,6 +88,18 @@ as success or failure for a command needs one live check per command family
   SDCP (TCP 53484) and the web UI (TCP 80) both accept connections. From 1.3.0
   the config entry is keyed by that serial number, and the ADCP lock-up Repair
   relies on those two ports answering while ADCP does not.
+- Observed 2026-10-07, in production history: the projector acknowledges
+  `power "on"` / `power "off"` **before** its `power_status ?` answer moves.
+  It still said `standby` 10 ms after accepting power on, and still said `on`
+  245 ms after accepting power off. `POWER_SETTLE` in `coordinator.py`
+  exists for this. Do not reintroduce an immediate read-back after a power
+  command; that is what 1.3.0 did, and it reversed its own state.
+- Also observed 2026-10-07 (one occurrence): `power "on"` sent during
+  `cooling2` was answered `ok` and dropped. 1.3.1 still sends it, because
+  production theater scripts call `media_player.turn_on` with no
+  `continue_on_error` and rely on their own retry. It shows the true cooling
+  phase and logs a warning instead. Raising an error here would make those
+  scripts abort.
 
 ## Git rules
 
