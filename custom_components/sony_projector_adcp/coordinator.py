@@ -16,10 +16,11 @@ import time
 from typing import Any, Optional
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -52,6 +53,19 @@ NUMERIC_MAX = 100
 WEDGE_POLLS = 3
 OTHER_PORTS = (53484, 80)  # SDCP / PJ Talk, web UI -- both open in standby
 PORT_PROBE_TIMEOUT = 3  # seconds
+
+# The projector acknowledges a power command before its own status moves.
+# Observed 2026-10-07: 10 ms after accepting `power "on"` it still answered
+# standby, and 245 ms after `power "off"` it still answered on. An immediate
+# read-back therefore reverted the commanded phase, and the reversal stood for
+# up to 30s. For this long after a power command, a read that still reports
+# the old side keeps the commanded phase; one confirming read follows at the
+# end, so a command the projector never acts on is not shown as done for good.
+# Well inside warm-up (17-26s to "on" across four sessions, 2026-08/09).
+POWER_SETTLE = 10  # seconds
+# Observed 2026-10-07 (one occurrence): `power "on"` during cooling2 was
+# accepted with "ok" and dropped.
+COOLING = ("cooling1", "cooling2")
 
 
 def adcp_issue_id(entry_id: str) -> str:
@@ -138,6 +152,10 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
         # lock), so the poll may have read a value from before the command;
         # these are re-applied to its result so a slider does not jump back.
         self._poll_overrides: Optional[dict[str, Any]] = None
+        # (commanded on?, time.monotonic() of the command) while a power
+        # command's settle window is open; see POWER_SETTLE.
+        self._power_pending: Optional[tuple[bool, float]] = None
+        self._settle_unsub: Optional[CALLBACK_TYPE] = None
         self.identity = ProjectorIdentity()
         # Consecutive failed polls, kept in hass.data so the count survives
         # setup retries and reloads -- each of those builds a new coordinator,
@@ -193,6 +211,7 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
             await self._check_for_wedge()
             raise UpdateFailed(f"Projector unreachable: {reason}")
         self._clear_wedge()
+        power_status = self._hold_commanded_phase(power_status)
 
         previous = self.data
         state = ProjectorState(
@@ -230,6 +249,24 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
                 self._timer_read_at = now
 
         return state
+
+    def _hold_commanded_phase(self, power_status: str) -> str:
+        """The phase to report, given a read taken after a power command.
+
+        Inside the settle window a read still on the old side is the
+        projector lagging, not a reversal: keep the commanded phase. A read on
+        the commanded side closes the window, so later reads count as they are.
+        """
+        if self._power_pending is None:
+            return power_status
+        commanded_on, issued_at = self._power_pending
+        if (POWER_STATE_MAP.get(power_status) == "on") == commanded_on:
+            self._power_pending = None
+            return power_status
+        if time.monotonic() - issued_at < POWER_SETTLE and self.data is not None:
+            return self.data.power_status
+        self._power_pending = None
+        return power_status
 
     # -- ADCP lock-up repair -------------------------------------------------
 
@@ -314,12 +351,56 @@ class SonyProjectorCoordinator(DataUpdateCoordinator[ProjectorState]):
 
     async def async_set_power(self, on: bool) -> None:
         """Turn the projector on or off."""
+        cooling = None
+        if on and (status := await self.projector.get_power_status()) in COOLING:
+            cooling = status
         self._require(
             await self.projector.set_power(on), "turn on" if on else "turn off"
         )
-        # Show the transition immediately; the poll reports the real phase.
+        if cooling:
+            # Still sent, so success and failure are unchanged for callers
+            # (the theater scripts retry on their own), but not shown as a
+            # warm-up that will not happen.
+            _LOGGER.warning(
+                "Projector is cooling down (%s) and ignores power on until it "
+                "reaches standby; turn it on again then",
+                cooling,
+            )
+            self._patch(power_status=cooling)
+            return
+        # Show the transition immediately; reads that lag behind it are held
+        # until the projector catches up or the settle window ends.
+        self._power_pending = (on, time.monotonic())
         self._patch(power_status="startup" if on else "cooling1")
+        self._schedule_settle_read()
+
+    def _schedule_settle_read(self) -> None:
+        """Confirm the power phase once the settle window ends."""
+        if self._settle_unsub is not None:
+            self._settle_unsub()
+        # cancel_on_shutdown: HA does not unload entries on stop, and a read
+        # fired mid-shutdown would open an ADCP session, as the interval poll
+        # is also prevented from doing.
+        self._settle_unsub = async_call_later(
+            self.hass,
+            POWER_SETTLE,
+            HassJob(self._settle_read, cancel_on_shutdown=True),
+        )
+
+    @callback
+    def _settle_read(self, _now: Any) -> None:
+        self._settle_unsub = None
+        # Close the window first: this read is the confirmation and is taken
+        # as it comes, even if the timer fired a hair before POWER_SETTLE.
+        self._power_pending = None
         self._refresh_soon()
+
+    async def async_shutdown(self) -> None:
+        """Cancel a pending confirming read, then shut down."""
+        if self._settle_unsub is not None:
+            self._settle_unsub()
+            self._settle_unsub = None
+        await super().async_shutdown()
 
     async def async_set_source(self, source: str, label: str) -> None:
         """Switch input."""
